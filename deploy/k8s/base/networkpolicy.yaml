@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sentinelflow-api-deny-unapproved
+  namespace: sentinelflow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelflow-api
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sentinelflow-api
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress: []

@@ -1,0 +1,138 @@
+name: SentinelFlow | Phase 1 Security CI
+
+on:
+  pull_request:
+    branches: [main, qa]
+  push:
+    branches: [main, qa]
+  workflow_dispatch:
+
+# CI never needs cloud credentials or elevated repository permissions.
+permissions:
+  contents: read
+
+concurrency:
+  group: sentinelflow-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests + smoke tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install reproducibly
+        working-directory: apps/api
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run tests
+        working-directory: apps/api
+        run: npm run test:coverage
+      - name: HTTP smoke test
+        run: bash scripts/smoke.sh
+
+  secret-scan:
+    name: Secrets | Gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_COMMENTS: 'false'
+
+  sast:
+    name: SAST | Semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Scan source code
+        # Pin the Semgrep container by immutable digest in Phase 2.
+        run: >-
+          docker run --rm
+          -v "$PWD:/src" -w /src
+          semgrep/semgrep:latest
+          semgrep scan --config p/ci --error --metrics=off apps/api/src
+
+  iac:
+    name: Kubernetes IaC | Checkov
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Scan Kubernetes baseline
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: deploy/k8s/base
+          framework: kubernetes
+          # Phase-1 baseline: concrete security invariants are blocking.
+          # Digest verification (CKV_K8S_43) begins when images are published in Phase 2.
+          check: CKV_K8S_8,CKV_K8S_9,CKV_K8S_20,CKV_K8S_22,CKV_K8S_23,CKV_K8S_31,CKV_K8S_37,CKV_K8S_38,CKV_K8S_40
+          quiet: true
+          soft_fail: false
+
+  container-security:
+    name: Container CVEs + SBOM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build nonroot runtime image
+        run: docker build -f apps/api/Dockerfile -t sentinelflow-api:ci .
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: sentinelflow-api:ci
+          artifact-name: sentinelflow-api.spdx.json
+      - name: Gate HIGH and CRITICAL image findings
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: sentinelflow-api:ci
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+  security-gate:
+    name: REQUIRED | Security Gate
+    if: always()
+    needs: [unit-tests, secret-scan, sast, iac, container-security]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce all required checks
+        env:
+          TESTS: ${{ needs.unit-tests.result }}
+          SECRETS: ${{ needs.secret-scan.result }}
+          SAST: ${{ needs.sast.result }}
+          IAC: ${{ needs.iac.result }}
+          CONTAINER: ${{ needs.container-security.result }}
+        shell: bash
+        run: |
+          for entry in "tests=$TESTS" "secrets=$SECRETS" "sast=$SAST" "iac=$IAC" "container=$CONTAINER"; do
+            echo "$entry"
+            if [[ "$entry" != *=success ]]; then
+              echo "Security gate failed due to: $entry" >&2
+              exit 1
+            fi
+          done
+          echo 'All Phase 1 security checks passed.'
