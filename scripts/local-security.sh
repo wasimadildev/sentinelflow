@@ -16,5 +16,4 @@ checkov --directory deploy/k8s/base --framework kubernetes --check CKV_K8S_8,CKV
 trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 .
 
 syft dir:. -o spdx-json=evidence/source-sbom.spdx.json
-
 echo 'Local security scans passed; SBOM at evidence/source-sbom.spdx.json.'
