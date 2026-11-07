@@ -1,0 +1,202 @@
+name: SentinelFlow | Phase 2 Signed Release
+
+# Only reviewed main-branch commits may publish; this pipeline never runs on PRs.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentinelflow-phase2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  security-ci:
+    name: Reuse Phase 1 security gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    secrets: inherit
+
+  pinned-dependencies:
+    name: Verify dependencies before privileged job
+    needs: [security-ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Fail closed on unpinned actions or images
+        run: |
+          python3 scripts/pin_actions.py --check
+          python3 scripts/pin_container_images.py --check
+
+  signed-release:
+    name: Build, sign, attest, and verify release
+    needs: [pinned-dependencies]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout approved source (no persisted credentials)
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Require immutable dependencies for privileged publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/pin_actions.py --check
+          python3 scripts/pin_container_images.py --check
+
+      - name: Normalize package name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${owner}/sentinelflow-api" >> "$GITHUB_OUTPUT"
+
+      - name: Install build tooling
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to GHCR with temporary workflow token
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish reviewed source
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.title=SentinelFlow API
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          provenance: mode=max
+          sbom: false
+
+      - name: Generate SPDX JSON SBOM for the published digest
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: artifacts/sentinelflow-api.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Validate image digest and SBOM before signing
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/validate_sbom.py artifacts/sentinelflow-api.spdx.json
+          python3 scripts/release_metadata.py create \
+            --file artifacts/release.json \
+            --image "$IMAGE" --digest "$DIGEST" \
+            --repo "$REPO" --commit "$COMMIT" \
+            --sbom artifacts/sentinelflow-api.spdx.json
+          python3 scripts/release_metadata.py verify --file artifacts/release.json
+          python3 scripts/render_release_overlay.py \
+            --release artifacts/release.json \
+            --output artifacts/release-kustomization.yaml
+
+      - name: Install Sigstore Cosign
+        uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Sign and verify immutable digest with exact workflow identity
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image_ref="${IMAGE}@${DIGEST}"
+          identity="https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/heads/main"
+          cosign sign --yes "$image_ref"
+          cosign verify \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$image_ref"
+
+      # Public repositories work on GitHub's standard plans. For private repos,
+      # consult GitHub's attestation plan requirements before enabling this job.
+      - name: Create signed SLSA build-provenance attestation
+        id: provenance
+        if: vars.ENABLE_GITHUB_ATTESTATIONS != 'false'
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Create signed SPDX SBOM attestation
+        if: vars.ENABLE_GITHUB_ATTESTATIONS != 'false'
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: artifacts/sentinelflow-api.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Verify release identity and SLSA attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SKIP_GITHUB_ATTESTATION: ${{ vars.ENABLE_GITHUB_ATTESTATIONS == 'false' && '1' || '0' }}
+        run: bash scripts/verify-release.sh artifacts/release.json
+
+      - name: Upload verified release metadata and SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinelflow-release-${{ github.sha }}
+          path: |
+            artifacts/release.json
+            artifacts/sentinelflow-api.spdx.json
+            artifacts/release-kustomization.yaml
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Print release summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '## SentinelFlow verified release'
+            echo ''
+            echo 'Immutable image reference:'
+            echo '```'
+            python3 scripts/release_metadata.py get --file artifacts/release.json --field image_ref
+            echo '```'
+            echo 'SBOM: SPDX JSON, workflow artifact attached.'
+            echo 'Cosign: signed and verified against this main-branch workflow identity.'
+            echo 'GitHub attestations: check whether ENABLE_GITHUB_ATTESTATIONS was disabled.'
+          } >> "$GITHUB_STEP_SUMMARY"

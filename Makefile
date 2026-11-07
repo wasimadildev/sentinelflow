@@ -25,3 +25,20 @@ smoke:
 
 local-security:
 	bash scripts/local-security.sh
+
+
+
+.PHONY: phase2-test phase2-validate phase2-render phase2-verify
+phase2-test:
+	python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+# Run after downloading an actual release artifact from GitHub Actions.
+phase2-validate:
+	python3 scripts/validate_sbom.py artifacts/sentinelflow-api.spdx.json
+	python3 scripts/release_metadata.py verify --file artifacts/release.json
+
+phase2-render:
+	python3 scripts/render_release_overlay.py --release artifacts/release.json --output deploy/k8s/overlays/release/kustomization.yaml
+
+phase2-verify:
+	bash scripts/verify-release.sh artifacts/release.json

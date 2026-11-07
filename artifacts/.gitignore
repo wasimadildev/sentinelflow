@@ -1,0 +1,5 @@
+# Generated runtime evidence is only an output of the publishing job.
+*.json
+*.yaml
+*.spdx
+*.spdx.json
